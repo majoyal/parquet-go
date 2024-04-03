@@ -35,11 +35,13 @@ type ParquetWriter struct {
 	ObjSize           int64
 	CheckSizeCritical int64
 
-	PagesMapBuf map[string][]*layout.Page
-	Size        int64
-	NumRows     int64
+	PagesMapMutex sync.Mutex
+	PagesMapBuf   map[string][]*layout.Page
+	Size          int64
+	NumRows       int64
 
-	DictRecs map[string]*layout.DictRecType
+	DictRecsMutex sync.Mutex
+	DictRecs      map[string]*layout.DictRecType
 
 	ColumnIndexes []*parquet.ColumnIndex
 	OffsetIndexes []*parquet.OffsetIndex
@@ -271,7 +273,6 @@ func (pw *ParquetWriter) flushObjs() error {
 
 	var c int64 = 0
 	delta := (l + pw.NP - 1) / pw.NP
-	lock := new(sync.Mutex)
 	var wg sync.WaitGroup
 	var errs []error = make([]error, pw.NP)
 
@@ -314,19 +315,23 @@ func (pw *ParquetWriter) flushObjs() error {
 
 						func() {
 							if pw.NP > 1 {
-								lock.Lock()
-								defer lock.Unlock()
+								pw.DictRecsMutex.Lock()
+								defer pw.DictRecsMutex.Unlock()
 							}
 							if _, ok := pw.DictRecs[name]; !ok {
 								pw.DictRecs[name] = layout.NewDictRec(*table.Schema.Type)
 							}
+							pw.PagesMapMutex.Lock()
 							pagesMapList[index][name], _ = layout.TableToDictDataPages(pw.DictRecs[name],
 								table, int32(pw.PageSize), 32, pw.CompressionType)
+							pw.PagesMapMutex.Unlock()
 						}()
 
 					} else {
+						pw.PagesMapMutex.Lock()
 						pagesMapList[index][name], _ = layout.TableToDataPages(table, int32(pw.PageSize),
 							pw.CompressionType)
+						pw.PagesMapMutex.Unlock()
 					}
 				}
 			} else {
@@ -347,11 +352,13 @@ func (pw *ParquetWriter) flushObjs() error {
 
 	for _, pagesMap := range pagesMapList {
 		for name, pages := range pagesMap {
+			pw.PagesMapMutex.Lock()
 			if _, ok := pw.PagesMapBuf[name]; !ok {
 				pw.PagesMapBuf[name] = pages
 			} else {
 				pw.PagesMapBuf[name] = append(pw.PagesMapBuf[name], pages...)
 			}
+			pw.PagesMapMutex.Unlock()
 			for _, page := range pages {
 				pw.Size += int64(len(page.RawData))
 				page.DataTable = nil //release memory
@@ -385,7 +392,9 @@ func (pw *ParquetWriter) Flush(flag bool) error {
 			}
 		}
 
+		pw.DictRecsMutex.Lock()
 		pw.DictRecs = make(map[string]*layout.DictRecType) //clean records for next chunks
+		pw.DictRecsMutex.Unlock()
 
 		//chunks -> rowGroup
 		rowGroup := layout.NewRowGroup()
@@ -490,7 +499,9 @@ func (pw *ParquetWriter) Flush(flag bool) error {
 
 		pw.Footer.RowGroups = append(pw.Footer.RowGroups, rowGroup.RowGroupHeader)
 		pw.Size = 0
+		pw.PagesMapMutex.Lock()
 		pw.PagesMapBuf = make(map[string][]*layout.Page)
+		pw.PagesMapMutex.Unlock()
 	}
 	pw.Footer.NumRows += int64(len(pw.Objs))
 	pw.Objs = pw.Objs[:0]
